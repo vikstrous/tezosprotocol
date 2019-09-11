@@ -27,7 +27,8 @@ const (
 
 	// NewAccountStorageLimitBytes is the storage needed to create a new
 	// account, either implicit or originated.
-	NewAccountStorageLimitBytes = int64(257)
+	// TODO: adjust for babylon; 2570 wasn't enough
+	NewAccountStorageLimitBytes = int64(25700)
 
 	// NewAccountCreationBurn is the cost in mutez burned from an account that signs
 	// an operation creating a new account, either by a transferring to a new implicit address
@@ -52,7 +53,8 @@ const (
 
 	// OriginationGasLimit is the gas consumed by a simple origination.
 	// reference: http://tezos.gitlab.io/mainnet/protocols/003_PsddFKi3.html#more-details-on-fees-and-cost-model
-	OriginationGasLimit = int64(10000)
+	// TODO: update for babylon contracts that use up way more gas
+	OriginationGasLimit = int64(20000)
 
 	// MinimumOriginationSizeBytes is the smallest size in bytes of a serialized,
 	// signed origination operation
@@ -94,7 +96,7 @@ const (
 
 	// MinimumTransactionGasLimit is the gas consumed by a transaction with no parameters
 	// that does not result in any Michelson code execution.
-	MinimumTransactionGasLimit = int64(10200)
+	MinimumTransactionGasLimit = int64(20200) // TODO: Put in the right number; TODO: make sure when this is low, we detect the failure on-chain
 
 	// DelegationGasLimit is the gas consumed by a delegation
 	DelegationGasLimit = int64(10000)

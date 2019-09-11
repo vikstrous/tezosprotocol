@@ -229,6 +229,41 @@ func NewContractIDFromOrigination(operationHash OperationHash, nonce uint32) (Co
 	return contractID, err
 }
 
+// MarshalBinaryWithinManagerOperation is a special encoding of contract IDs that can't be contract hashes (KT1) used in manager operations. Reference:
+// https://gitlab.com/tezos/tezos/blob/master/docs/protocols/005_PsBABY5H.rst#id21
+// XXX: this is also known as a tagged pub key hash in this code base, so we should deduplicate those concepts
+// This method is also somewhat redundant with EncodePubKeyHash and the normal MarshalBinary
+func (c ContractID) MarshalBinaryWithinManagerOperation() ([]byte, error) {
+	b58prefix, b58decoded, err := Base58CheckDecode(string(c))
+	if err != nil {
+		return nil, err
+	}
+
+	buf := bytes.Buffer{}
+
+	switch b58prefix {
+	case PrefixEd25519PublicKeyHash, PrefixSecp256k1PublicKeyHash, PrefixP256PublicKeyHash:
+		switch b58prefix {
+		case PrefixEd25519PublicKeyHash:
+			buf.WriteByte(byte(PubKeyHashTagEd25519))
+		case PrefixSecp256k1PublicKeyHash:
+			buf.WriteByte(byte(PubKeyHashTagSecp256k1))
+		case PrefixP256PublicKeyHash:
+			buf.WriteByte(byte(PubKeyHashTagP256))
+		}
+		// public key hash
+		if len(b58decoded) != PubKeyHashLen {
+			return nil, xerrors.Errorf("expected address %s to have %d bytes for PKH. Saw %d bytes", c, PubKeyHashLen, len(b58decoded))
+		}
+		buf.Write(b58decoded)
+
+	default:
+		return nil, xerrors.Errorf("unexpected base58check prefix %s in %s", b58prefix, c)
+	}
+
+	return buf.Bytes(), nil
+}
+
 // MarshalBinary implements encoding.BinaryMarshaler. Reference:
 // http://tezos.gitlab.io/mainnet/api/p2p.html#contract-id-22-bytes-8-bit-tag
 func (c ContractID) MarshalBinary() ([]byte, error) {
@@ -271,6 +306,32 @@ func (c ContractID) MarshalBinary() ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// UnmarshalBinaryWithinManagerOperation is a special encoding of contract IDs that can't be contract hashes (KT1) used in manager operations. Reference:
+// https://gitlab.com/tezos/tezos/blob/master/docs/protocols/005_PsBABY5H.rst#id21
+func (c *ContractID) UnmarshalBinaryWithinManagerOperation(data []byte) error {
+	if len(data) < ContractIDLen-1 {
+		return xerrors.Errorf("expected %d bytes for contract ID, received %d", ContractIDLen-1, len(data))
+	}
+	pubKeyHashTag := PubKeyHashTag(data[0])
+	pubKeyHash := data[1:]
+	switch pubKeyHashTag {
+	case PubKeyHashTagEd25519:
+		encoded, err := Base58CheckEncode(PrefixEd25519PublicKeyHash, pubKeyHash)
+		*c = ContractID(encoded)
+		return err
+	case PubKeyHashTagSecp256k1:
+		encoded, err := Base58CheckEncode(PrefixSecp256k1PublicKeyHash, pubKeyHash)
+		*c = ContractID(encoded)
+		return err
+	case PubKeyHashTagP256:
+		encoded, err := Base58CheckEncode(PrefixP256PublicKeyHash, pubKeyHash)
+		*c = ContractID(encoded)
+		return err
+	default:
+		return xerrors.Errorf("unexpected pub_key_hash tag %d", pubKeyHashTag)
+	}
 }
 
 // UnmarshalBinary implements encoding.BinaryUnmarshaler
@@ -460,25 +521,25 @@ func (o *Operation) UnmarshalBinary(data []byte) (err error) {
 		tag := ContentsTag(dataPtr[0])
 		var content OperationContents
 		switch tag {
-		case ContentsTagRevelation:
+		case ContentsTagRevelation, ContentsTagRevelation + 100:
 			content = &Revelation{}
 			err = content.UnmarshalBinary(dataPtr)
 			if err != nil {
 				return xerrors.Errorf("failed to unmarshal revelation: %w", err)
 			}
-		case ContentsTagTransaction:
+		case ContentsTagTransaction, ContentsTagTransaction + 100:
 			content = &Transaction{}
 			err = content.UnmarshalBinary(dataPtr)
 			if err != nil {
 				return xerrors.Errorf("failed to unmarshal transaction: %w", err)
 			}
-		case ContentsTagOrigination:
+		case ContentsTagOrigination, ContentsTagOrigination + 100:
 			content = &Origination{}
 			err = content.UnmarshalBinary(dataPtr)
 			if err != nil {
 				return xerrors.Errorf("failed to unmarshal origination: %w", err)
 			}
-		case ContentsTagDelegation:
+		case ContentsTagDelegation, ContentsTagDelegation + 100:
 			content = &Delegation{}
 			err = content.UnmarshalBinary(dataPtr)
 			if err != nil {
@@ -526,6 +587,7 @@ type Revelation struct {
 	GasLimit     *big.Int
 	StorageLimit *big.Int
 	PublicKey    PublicKey
+	Manager      bool // indicates if this is initiated by a manager
 }
 
 func (r *Revelation) String() string {
@@ -534,6 +596,9 @@ func (r *Revelation) String() string {
 
 // GetTag implements OperationContents
 func (r *Revelation) GetTag() ContentsTag {
+	if r.Manager {
+		return ContentsTagRevelation + 100
+	}
 	return ContentsTagRevelation
 }
 
@@ -550,9 +615,18 @@ func (r *Revelation) MarshalBinary() ([]byte, error) {
 	buf.WriteByte(byte(r.GetTag()))
 
 	// source
-	sourceBytes, err := r.Source.MarshalBinary()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to write source: %w", err)
+	var sourceBytes []byte
+	var err error
+	if r.Manager {
+		sourceBytes, err = r.Source.MarshalBinaryWithinManagerOperation()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
+	} else {
+		sourceBytes, err = r.Source.MarshalBinary()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
 	}
 	buf.Write(sourceBytes)
 
@@ -607,17 +681,29 @@ func (r *Revelation) UnmarshalBinary(data []byte) (err error) {
 
 	// tag
 	tag := ContentsTag(dataPtr[0])
+	if tag-100 == ContentsTagRevelation {
+		tag -= 100
+		r.Manager = true
+	}
 	if tag != ContentsTagRevelation {
 		return xerrors.Errorf("invalid tag for revelation. Expected %d, saw %d", ContentsTagRevelation, tag)
 	}
 	dataPtr = dataPtr[1:]
 
 	// source
-	err = r.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
-	if err != nil {
-		return xerrors.Errorf("failed to unmarshal source: %w", err)
+	if r.Manager {
+		err = r.Source.UnmarshalBinaryWithinManagerOperation(dataPtr[:ContractIDLen-1])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen-1:]
+	} else {
+		err = r.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen:]
 	}
-	dataPtr = dataPtr[ContractIDLen:]
 
 	// fee
 	var bytesRead int
@@ -657,6 +743,19 @@ func (r *Revelation) UnmarshalBinary(data []byte) (err error) {
 	return nil
 }
 
+// Entrypoint is an entrypoint to a smart contract
+type Entrypoint uint8
+
+// EntrypointDefault and the rest are the possible values of the entrypoint
+const (
+	EntrypointDefault        Entrypoint = 0
+	EntrypointRoot           Entrypoint = 1
+	EntrypointDo             Entrypoint = 2
+	EntrypointSetDelegate    Entrypoint = 3
+	EntrypointRemoveDelegate Entrypoint = 4
+	EntrypointNamed          Entrypoint = 255 // not implemented
+)
+
 // Transaction models the tezos transaction type
 type Transaction struct {
 	Source       ContractID
@@ -666,7 +765,9 @@ type Transaction struct {
 	StorageLimit *big.Int
 	Amount       *big.Int
 	Destination  ContractID
-	// TODO: parameters
+	Manager      bool // indicates if this is initiated by a manager
+	Entrypoint   Entrypoint
+	Parameter    []byte
 }
 
 func (t *Transaction) String() string {
@@ -675,6 +776,9 @@ func (t *Transaction) String() string {
 
 // GetTag implements OperationContents
 func (t *Transaction) GetTag() ContentsTag {
+	if t.Manager {
+		return ContentsTagTransaction + 100
+	}
 	return ContentsTagTransaction
 }
 
@@ -683,7 +787,7 @@ func (t *Transaction) GetSource() ContractID {
 	return t.Source
 }
 
-// MmarshalBinary implements encoding.BinaryMarshaler
+// MarshalBinary implements encoding.BinaryMarshaler
 func (t *Transaction) MarshalBinary() ([]byte, error) {
 	buf := bytes.Buffer{}
 
@@ -691,9 +795,18 @@ func (t *Transaction) MarshalBinary() ([]byte, error) {
 	buf.WriteByte(byte(t.GetTag()))
 
 	// source
-	sourceBytes, err := t.Source.MarshalBinary()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to write source: %w", err)
+	var sourceBytes []byte
+	var err error
+	if t.Manager {
+		sourceBytes, err = t.Source.MarshalBinaryWithinManagerOperation()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
+	} else {
+		sourceBytes, err = t.Source.MarshalBinary()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
 	}
 	buf.Write(sourceBytes)
 
@@ -741,6 +854,17 @@ func (t *Transaction) MarshalBinary() ([]byte, error) {
 
 	// no parameters follow
 	buf.WriteByte(0)
+	// TODO: put the right entrypoint byte and the contract execution parameters here if necessary (as well as write 1 above)
+	// https://gitlab.com/tezos/tezos/blob/master/docs/protocols/005_PsBABY5H.rst#id22
+	/*
+		one byte 0 for entrypoint %default
+		one byte 1 for entrypoint %root
+		one byte 2 for entrypoint %do
+		one byte 3 for entrypoint %set_delegate
+		one byte 4 for entrypoint %remove_delegate
+		one byte 255 for a named entrypoint, then one byte of entrypoint
+		name size (limited to 31), and the name itself
+	*/
 
 	return buf.Bytes(), nil
 }
@@ -758,17 +882,29 @@ func (t *Transaction) UnmarshalBinary(data []byte) (err error) {
 
 	// tag
 	tag := ContentsTag(dataPtr[0])
+	if tag-100 == ContentsTagTransaction {
+		tag -= 100
+		t.Manager = true
+	}
 	if tag != ContentsTagTransaction {
 		return xerrors.Errorf("invalid tag for transaction. Expected %d, saw %d", ContentsTagTransaction, tag)
 	}
 	dataPtr = dataPtr[1:]
 
 	// source
-	err = t.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
-	if err != nil {
-		return xerrors.Errorf("failed to unmarshal source: %w", err)
+	if t.Manager {
+		err = t.Source.UnmarshalBinaryWithinManagerOperation(dataPtr[:ContractIDLen-1])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen-1:]
+	} else {
+		err = t.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen:]
 	}
-	dataPtr = dataPtr[ContractIDLen:]
 
 	// fee
 	var bytesRead int
@@ -825,6 +961,9 @@ func (t *Transaction) UnmarshalBinary(data []byte) (err error) {
 	return nil
 }
 
+// Babylon controls whether we should marshal/unmarshal based on the babylon version of the structs or the pre-babylon version
+var Babylon = true
+
 // Origination models the tezos origination operation type.
 type Origination struct {
 	Source       ContractID
@@ -832,12 +971,15 @@ type Origination struct {
 	Counter      *big.Int
 	GasLimit     *big.Int
 	StorageLimit *big.Int
-	Manager      ContractID
 	Balance      *big.Int
-	Spendable    bool
-	Delegatable  bool
 	Delegate     *ContractID
-	// TODO: script
+	Manager      bool // indicates if this is initiated by a manager (implicit address), post-babylon only
+	Code         []byte
+	Storage      []byte
+	// Pre-babylon fields:
+	ManagerID   ContractID
+	Spendable   bool
+	Delegatable bool
 }
 
 func (o *Origination) String() string {
@@ -846,6 +988,9 @@ func (o *Origination) String() string {
 
 // GetTag implements OperationContents
 func (o *Origination) GetTag() ContentsTag {
+	if o.Manager {
+		return ContentsTagOrigination + 100
+	}
 	return ContentsTagOrigination
 }
 
@@ -862,9 +1007,18 @@ func (o *Origination) MarshalBinary() ([]byte, error) {
 	buf.WriteByte(byte(o.GetTag()))
 
 	// source
-	sourceBytes, err := o.Source.MarshalBinary()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to write source: %w", err)
+	var sourceBytes []byte
+	var err error
+	if o.Manager {
+		sourceBytes, err = o.Source.MarshalBinaryWithinManagerOperation()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
+	} else {
+		sourceBytes, err = o.Source.MarshalBinary()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
 	}
 	buf.Write(sourceBytes)
 
@@ -896,12 +1050,14 @@ func (o *Origination) MarshalBinary() ([]byte, error) {
 	}
 	buf.Write(storageLimit)
 
-	// manager pub key hash
-	managerPubKeyBytes, err := o.Manager.EncodePubKeyHash()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to write managerPubKey: %w", err)
+	if !Babylon {
+		// manager pub key hash
+		managerPubKeyBytes, err := o.ManagerID.EncodePubKeyHash()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write managerPubKey: %w", err)
+		}
+		buf.Write(managerPubKeyBytes)
 	}
-	buf.Write(managerPubKeyBytes)
 
 	// balance
 	balance, err := zarith.Encode(o.Balance)
@@ -910,11 +1066,13 @@ func (o *Origination) MarshalBinary() ([]byte, error) {
 	}
 	buf.Write(balance)
 
-	// spendable
-	buf.WriteByte(serializeBoolean(o.Spendable))
+	if !Babylon {
+		// spendable
+		buf.WriteByte(serializeBoolean(o.Spendable))
 
-	// delegatable
-	buf.WriteByte(serializeBoolean(o.Delegatable))
+		// delegatable
+		buf.WriteByte(serializeBoolean(o.Delegatable))
+	}
 
 	// delegate
 	hasDelegate := o.Delegate != nil
@@ -927,9 +1085,42 @@ func (o *Origination) MarshalBinary() ([]byte, error) {
 		buf.Write(delegatePubKeyHashBytes)
 	}
 
-	// script
-	hasScript := false
-	buf.WriteByte(serializeBoolean(hasScript))
+	if !Babylon {
+		if len(o.Code) > 0 || len(o.Storage) > 0 {
+			return nil, xerrors.Errorf("pre-babylon originations with scripts not implemented")
+		}
+
+		// script
+		hasScript := false
+		buf.WriteByte(serializeBoolean(hasScript))
+	} else {
+		// XXX: Write the mystery bytes
+		bytesBuf := new(bytes.Buffer)
+		err = binary.Write(bytesBuf, binary.BigEndian, uint32(len(o.Code)+5))
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write code length: %w", err)
+		}
+		buf.Write(bytesBuf.Bytes())
+
+		buf.Write([]byte{0x02})
+
+		// Write the script and storage
+		bytesBuf = new(bytes.Buffer)
+		err = binary.Write(bytesBuf, binary.BigEndian, uint32(len(o.Code)))
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write code length: %w", err)
+		}
+		buf.Write(bytesBuf.Bytes())
+		buf.Write(o.Code)
+
+		bytesBuf = new(bytes.Buffer)
+		err = binary.Write(bytesBuf, binary.BigEndian, uint32(len(o.Storage)))
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write storage length: %w", err)
+		}
+		buf.Write(bytesBuf.Bytes())
+		buf.Write(o.Storage)
+	}
 
 	return buf.Bytes(), nil
 }
@@ -947,17 +1138,29 @@ func (o *Origination) UnmarshalBinary(data []byte) (err error) {
 
 	// tag
 	tag := ContentsTag(dataPtr[0])
+	if tag-100 == ContentsTagOrigination {
+		tag -= 100
+		o.Manager = true
+	}
 	if tag != ContentsTagOrigination {
 		return xerrors.Errorf("invalid tag for origination. Expected %d, saw %d", ContentsTagOrigination, tag)
 	}
 	dataPtr = dataPtr[1:]
 
 	// source
-	err = o.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
-	if err != nil {
-		return xerrors.Errorf("failed to unmarshal source: %w", err)
+	if o.Manager {
+		err = o.Source.UnmarshalBinaryWithinManagerOperation(dataPtr[:ContractIDLen-1])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen-1:]
+	} else {
+		err = o.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen:]
 	}
-	dataPtr = dataPtr[ContractIDLen:]
 
 	// fee
 	var bytesRead int
@@ -988,12 +1191,13 @@ func (o *Origination) UnmarshalBinary(data []byte) (err error) {
 	}
 	dataPtr = dataPtr[bytesRead:]
 
-	// manager (from pub key hash)
-	taggedPubKeyHash := dataPtr[:TaggedPubKeyHashLen]
-	managerContractID := append([]byte{byte(ContractIDTagImplicit)}, taggedPubKeyHash...)
-	err = o.Manager.UnmarshalBinary(managerContractID)
-	dataPtr = dataPtr[TaggedPubKeyHashLen:]
-
+	if !Babylon {
+		// manager (from pub key hash)
+		taggedPubKeyHash := dataPtr[:TaggedPubKeyHashLen]
+		managerContractID := append([]byte{byte(ContractIDTagImplicit)}, taggedPubKeyHash...)
+		err = o.ManagerID.UnmarshalBinary(managerContractID)
+		dataPtr = dataPtr[TaggedPubKeyHashLen:]
+	}
 	// balance
 	o.Balance, bytesRead, err = zarith.ReadNext(dataPtr)
 	if err != nil {
@@ -1001,19 +1205,21 @@ func (o *Origination) UnmarshalBinary(data []byte) (err error) {
 	}
 	dataPtr = dataPtr[bytesRead:]
 
-	// spendable
-	o.Spendable, err = deserializeBoolean(dataPtr[0])
-	if err != nil {
-		return xerrors.Errorf("failed to deserialize spendable: %w", err)
-	}
-	dataPtr = dataPtr[1:]
+	if !Babylon {
+		// spendable
+		o.Spendable, err = deserializeBoolean(dataPtr[0])
+		if err != nil {
+			return xerrors.Errorf("failed to deserialize spendable: %w", err)
+		}
+		dataPtr = dataPtr[1:]
 
-	// delegatable
-	o.Delegatable, err = deserializeBoolean(dataPtr[0])
-	if err != nil {
-		return xerrors.Errorf("failed to deserialize delegatable: %w", err)
+		// delegatable
+		o.Delegatable, err = deserializeBoolean(dataPtr[0])
+		if err != nil {
+			return xerrors.Errorf("failed to deserialize delegatable: %w", err)
+		}
+		dataPtr = dataPtr[1:]
 	}
-	dataPtr = dataPtr[1:]
 
 	// delegate
 	hasDelegate, err := deserializeBoolean(dataPtr[0])
@@ -1022,7 +1228,7 @@ func (o *Origination) UnmarshalBinary(data []byte) (err error) {
 	}
 	dataPtr = dataPtr[1:]
 	if hasDelegate {
-		taggedPubKeyHash = dataPtr[:TaggedPubKeyHashLen]
+		taggedPubKeyHash := dataPtr[:TaggedPubKeyHashLen]
 		delegateContractIDBytes := append([]byte{byte(ContractIDTagImplicit)}, taggedPubKeyHash...)
 		var delegate ContractID
 		err = delegate.UnmarshalBinary(delegateContractIDBytes)
@@ -1033,13 +1239,41 @@ func (o *Origination) UnmarshalBinary(data []byte) (err error) {
 		dataPtr = dataPtr[TaggedPubKeyHashLen:]
 	}
 
-	// script
-	hasScript, err := deserializeBoolean(dataPtr[0])
-	if err != nil {
-		return xerrors.Errorf("failed to deserialize presence of field \"script\": %w", err)
+	if !Babylon {
+		// script
+		hasScript, err := deserializeBoolean(dataPtr[0])
+		if err != nil {
+			return xerrors.Errorf("failed to deserialize presence of field \"script\": %w", err)
+		}
+		if hasScript {
+			return xerrors.New("deserializing scripts not yet supported")
+		}
+	} else {
+		// XXX: skip mystery bytes
+		dataPtr = dataPtr[5:]
+
+		var codeLenInt uint32
+		err = binary.Read(bytes.NewReader(dataPtr), binary.BigEndian, &codeLenInt)
+		if err != nil {
+			return xerrors.Errorf("failed to read code length: %w", err)
+		}
+		dataPtr = dataPtr[4:]
+
+		o.Code = dataPtr[:int(codeLenInt)]
+		dataPtr = dataPtr[int(codeLenInt):]
+
+		var storageLenInt uint32
+		err = binary.Read(bytes.NewReader(dataPtr), binary.BigEndian, &storageLenInt)
+		if err != nil {
+			return xerrors.Errorf("failed to read storage length: %w", err)
+		}
+		dataPtr = dataPtr[4:]
+
+		o.Storage = dataPtr[:int(storageLenInt)]
+		dataPtr = dataPtr[int(storageLenInt):]
 	}
-	if hasScript {
-		return xerrors.New("deserializing scripts not yet supported")
+	if len(dataPtr) != 0 {
+		return xerrors.Errorf("%d left over bytes after parsing origination", len(dataPtr))
 	}
 
 	return nil
@@ -1053,6 +1287,7 @@ type Delegation struct {
 	GasLimit     *big.Int
 	StorageLimit *big.Int
 	Delegate     *ContractID
+	Manager      bool // indicates if this is initiated by a manager
 }
 
 func (d *Delegation) String() string {
@@ -1061,6 +1296,9 @@ func (d *Delegation) String() string {
 
 // GetTag implements OperationContents
 func (d *Delegation) GetTag() ContentsTag {
+	if d.Manager {
+		return ContentsTagDelegation + 100
+	}
 	return ContentsTagDelegation
 }
 
@@ -1077,9 +1315,18 @@ func (d *Delegation) MarshalBinary() ([]byte, error) {
 	buf.WriteByte(byte(d.GetTag()))
 
 	// source
-	sourceBytes, err := d.Source.MarshalBinary()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to write source: %w", err)
+	var sourceBytes []byte
+	var err error
+	if d.Manager {
+		sourceBytes, err = d.Source.MarshalBinaryWithinManagerOperation()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
+	} else {
+		sourceBytes, err = d.Source.MarshalBinary()
+		if err != nil {
+			return nil, xerrors.Errorf("failed to write source: %w", err)
+		}
 	}
 	buf.Write(sourceBytes)
 
@@ -1138,17 +1385,29 @@ func (d *Delegation) UnmarshalBinary(data []byte) (err error) {
 
 	// tag
 	tag := ContentsTag(dataPtr[0])
+	if tag-100 == ContentsTagDelegation {
+		tag -= 100
+		d.Manager = true
+	}
 	if tag != ContentsTagDelegation {
 		return xerrors.Errorf("invalid tag for delegation. Expected %d, saw %d", ContentsTagDelegation, tag)
 	}
 	dataPtr = dataPtr[1:]
 
 	// source
-	err = d.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
-	if err != nil {
-		return xerrors.Errorf("failed to unmarshal source: %w", err)
+	if d.Manager {
+		err = d.Source.UnmarshalBinaryWithinManagerOperation(dataPtr[:ContractIDLen-1])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen-1:]
+	} else {
+		err = d.Source.UnmarshalBinary(dataPtr[:ContractIDLen])
+		if err != nil {
+			return xerrors.Errorf("failed to unmarshal source: %w", err)
+		}
+		dataPtr = dataPtr[ContractIDLen:]
 	}
-	dataPtr = dataPtr[ContractIDLen:]
 
 	// fee
 	var bytesRead int
